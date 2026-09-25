@@ -3,9 +3,8 @@
 import uuid
 from datetime import datetime, timezone
 
-import requests
-
 from .config import Settings
+from .http_session import build_session
 from .models import TodoistTask
 from .sync_logic import normalize_todoist_due_date
 
@@ -13,11 +12,12 @@ TODOIST_BASE = "https://api.todoist.com/api/v1"
 
 
 class TodoistClient:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, session=None):
         self.headers = {
             "Authorization": f"Bearer {settings.todoist_token}",
             "Content-Type": "application/json",
         }
+        self.session = session or build_session()
 
     def _paginate(self, path, params=None):
         """Yield results from a cursor-paginated Todoist collection."""
@@ -27,7 +27,7 @@ class TodoistClient:
         while True:
             if cursor:
                 params["cursor"] = cursor
-            r = requests.get(f"{TODOIST_BASE}/{path}", headers=self.headers, params=params)
+            r = self.session.get(f"{TODOIST_BASE}/{path}", headers=self.headers, params=params)
             r.raise_for_status()
             data = r.json()
             yield from data.get("results", [])
@@ -38,7 +38,7 @@ class TodoistClient:
     def _post(self, path, payload):
         headers = dict(self.headers)
         headers["X-Request-Id"] = str(uuid.uuid4())
-        return requests.post(f"{TODOIST_BASE}/{path}", headers=headers, json=payload)
+        return self.session.post(f"{TODOIST_BASE}/{path}", headers=headers, json=payload)
 
     def get_project_id(self, project_name):
         for p in self._paginate("projects"):
@@ -102,7 +102,7 @@ class TodoistClient:
             req_params = dict(params)
             if cursor:
                 req_params["cursor"] = cursor
-            r = requests.get(
+            r = self.session.get(
                 f"{TODOIST_BASE}/tasks/completed/by_completion_date",
                 headers=self.headers,
                 params=req_params,

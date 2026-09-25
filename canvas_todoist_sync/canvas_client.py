@@ -1,14 +1,14 @@
 """Thin Canvas LMS API client. HTTP only — no sync decisions."""
 
-import requests
-
 from .config import Settings
+from .http_session import build_session
 
 
 class CanvasClient:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, session=None):
         self.base_url = settings.canvas_url
         self.headers = {"Authorization": f"Bearer {settings.canvas_token}"}
+        self.session = session or build_session()
 
     def _get_all(self, url, params=None):
         """GET a Canvas collection, following Link: rel="next" pagination."""
@@ -16,7 +16,7 @@ class CanvasClient:
         params.setdefault("per_page", 100)
         results = []
         while url:
-            r = requests.get(url, headers=self.headers, params=params)
+            r = self.session.get(url, headers=self.headers, params=params)
             r.raise_for_status()
             results.extend(r.json())
             url = r.links.get("next", {}).get("url")

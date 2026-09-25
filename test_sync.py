@@ -2,6 +2,7 @@
 
 import json
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from canvas_todoist_sync import state, sync, sync_logic
@@ -459,9 +460,9 @@ def test_get_completed_tasks_parses_items_and_paginates(monkeypatch):
             }
         )
 
-    monkeypatch.setattr("canvas_todoist_sync.todoist_client.requests.get", fake_get)
     client = TodoistClient.__new__(TodoistClient)
     client.headers = {}
+    client.session = SimpleNamespace(get=fake_get)
     since = NOW - timedelta(days=7)
     names = client.get_completed_tasks_by_completion_date("proj-1", since, NOW)
     assert names == {"[Math] HW1", "[Math] HW2"}
