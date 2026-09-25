@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Local sync state and logs (machine-specific)
+sync_state.json
+sync_log.txt
+launchd_stderr.log
+launchd_*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Editor / local tooling
+.claude/
+.vscode/
+.idea/
