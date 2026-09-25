@@ -1,7 +1,6 @@
 """Thin Todoist API client. HTTP and pagination only — no sync decisions."""
 
 import uuid
-from datetime import datetime, timezone
 
 from .config import Settings
 from .http_session import build_session
@@ -74,11 +73,6 @@ class TodoistClient:
         r.raise_for_status()
         return r.json()["id"]
 
-    def get_tasks(self, project_id=None):
-        """Returns {task_content: TodoistTask}, scoped to a project if given."""
-        params = {"project_id": project_id} if project_id else {}
-        return {t["content"]: _to_task(t) for t in self._paginate("tasks", params)}
-
     def get_active_tasks(self, project_id=None):
         """Returns {task_id: TodoistTask} for open tasks, scoped to a project if given."""
         params = {"project_id": project_id} if project_id else {}
@@ -106,38 +100,3 @@ class TodoistClient:
 
     def update_task(self, task_id, payload):
         return self._post(f"tasks/{task_id}", payload)
-
-    @staticmethod
-    def _format_rfc3339(dt: datetime) -> str:
-        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    def get_completed_tasks_by_completion_date(self, project_id, since: datetime, until: datetime):
-        """Return task content strings completed in [since, until] for a project."""
-        params = {
-            "since": self._format_rfc3339(since),
-            "until": self._format_rfc3339(until),
-            "limit": 200,
-        }
-        if project_id:
-            params["project_id"] = project_id
-        names: set[str] = set()
-        cursor = None
-        while True:
-            req_params = dict(params)
-            if cursor:
-                req_params["cursor"] = cursor
-            r = self.session.get(
-                f"{TODOIST_BASE}/tasks/completed/by_completion_date",
-                headers=self.headers,
-                params=req_params,
-            )
-            r.raise_for_status()
-            data = r.json()
-            for item in data.get("items", []):
-                content = item.get("content")
-                if content:
-                    names.add(content)
-            cursor = data.get("next_cursor")
-            if not cursor:
-                break
-        return names

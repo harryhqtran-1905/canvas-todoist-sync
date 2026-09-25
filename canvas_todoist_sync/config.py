@@ -8,8 +8,6 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 DAYS_AHEAD = 30
-COMPLETED_EXPIRY_DAYS = 105  # ~3.5 months
-COMPLETED_LOOKBACK_DAYS = 84  # completed-tasks API window (must stay under ~90 days)
 STALE_TRACKING_DAYS = 60     # drop tracked Canvas tasks this long past due
 LEGACY_STATE_DAYS = 105      # keep v1 task names this long after upgrading state
 
