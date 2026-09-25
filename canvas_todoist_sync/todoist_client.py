@@ -5,10 +5,26 @@ from datetime import datetime, timezone
 
 from .config import Settings
 from .http_session import build_session
-from .models import TodoistTask
+from .models import COMPLETED, DELETED, OPEN, TodoistTask
 from .sync_logic import normalize_todoist_due_date
 
 TODOIST_BASE = "https://api.todoist.com/api/v1"
+
+
+def _to_task(t) -> TodoistTask:
+    due = t.get("due") or {}
+    raw_date = due.get("date") or t.get("due_date")
+    due_datetime = due.get("datetime")
+    # Todoist sometimes stores a full datetime in due.date only.
+    if not due_datetime and raw_date and "T" in raw_date:
+        due_datetime = raw_date
+    return TodoistTask(
+        id=t["id"],
+        priority=t["priority"],
+        due_date=normalize_todoist_due_date(raw_date),
+        due_datetime=due_datetime,
+        content=t["content"],
+    )
 
 
 class TodoistClient:
@@ -61,21 +77,29 @@ class TodoistClient:
     def get_tasks(self, project_id=None):
         """Returns {task_content: TodoistTask}, scoped to a project if given."""
         params = {"project_id": project_id} if project_id else {}
-        tasks = {}
-        for t in self._paginate("tasks", params):
-            due = t.get("due") or {}
-            raw_date = due.get("date") or t.get("due_date")
-            due_datetime = due.get("datetime")
-            # Todoist sometimes stores a full datetime in due.date only.
-            if not due_datetime and raw_date and "T" in raw_date:
-                due_datetime = raw_date
-            tasks[t["content"]] = TodoistTask(
-                id=t["id"],
-                priority=t["priority"],
-                due_date=normalize_todoist_due_date(raw_date),
-                due_datetime=due_datetime,
-            )
-        return tasks
+        return {t["content"]: _to_task(t) for t in self._paginate("tasks", params)}
+
+    def get_active_tasks(self, project_id=None):
+        """Returns {task_id: TodoistTask} for open tasks, scoped to a project if given."""
+        params = {"project_id": project_id} if project_id else {}
+        return {t["id"]: _to_task(t) for t in self._paginate("tasks", params)}
+
+    def get_task_status(self, task_id) -> str:
+        """OPEN, COMPLETED or DELETED for one task, asked directly by ID.
+
+        Raises on network/server errors so the caller aborts the run
+        instead of guessing.
+        """
+        r = self.session.get(f"{TODOIST_BASE}/tasks/{task_id}", headers=self.headers)
+        if r.status_code == 404:
+            return DELETED
+        r.raise_for_status()
+        task = r.json()
+        if task.get("is_deleted"):
+            return DELETED
+        if task.get("checked"):
+            return COMPLETED
+        return OPEN
 
     def create_task(self, payload):
         return self._post("tasks", payload)
