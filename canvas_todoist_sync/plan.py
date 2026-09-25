@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Optional
 
 from .models import OPEN, Assignment, Link
-from .sync_logic import assign_priority, format_due_date, format_due_datetime
+from .sync_logic import assign_priority, format_due_date, format_due_datetime, parse_due_datetime
 
 PRIORITY_LABELS = {4: "p1", 3: "p2", 2: "p3", 1: "p4"}
 
@@ -125,7 +125,58 @@ def _plan_assignment(a, plan, active, statuses, unlinked_by_name, now, tz):
         plan.notes.append(f"Due date removed in Canvas, task left alone: {a.task_name}")
         plan.links[a.key] = replace(link, status=OPEN, canvas_due=None)
         return
-    plan.links[a.key] = replace(link, status=OPEN, canvas_due=new_canvas_due)
+    reopened = link.status != OPEN
+    push_due = reopened or new_canvas_due != link.canvas_due
+    _plan_update(a, link, task, push_due, plan, now)
+
+
+def _plan_update(a, link, task, push_due, plan, now):
+    """Bring an open, linked task in line with Canvas without undoing your edits.
+
+    Due date: pushed only when Canvas changed it (or you just reopened the
+    task); a date you set yourself is otherwise left alone.
+    Priority: follows the deadline while it is still the value the sync set;
+    once you change it, the sync only ever raises it.
+    """
+    desired_due = format_due_datetime(a.due_at)
+    desired_priority = assign_priority(a.due_at, now)
+    payload, reasons = {}, []
+
+    if push_due and not _same_instant(task.due_datetime, desired_due):
+        payload["due_datetime"] = desired_due
+        reasons.append("deadline changed")
+        if not _same_instant(task.due_datetime, link.synced_due):
+            plan.notes.append(f"Canvas deadline change replaced your Todoist due date: {a.task_name}")
+
+    if task.priority == link.synced_priority:
+        if desired_priority != task.priority:
+            payload["priority"] = desired_priority
+    elif desired_priority > task.priority:
+        payload["priority"] = desired_priority
+    if "priority" in payload:
+        reasons.append(f"priority {PRIORITY_LABELS[desired_priority]}")
+
+    new_link = replace(
+        link,
+        status=OPEN,
+        canvas_due=a.due_at.isoformat(),
+        synced_due=desired_due if push_due else link.synced_due,
+        synced_priority=payload.get("priority", link.synced_priority),
+    )
+    if payload:
+        plan.actions.append(
+            Action("update", a.key, a, payload, new_link, todoist_id=task.id, reason=", ".join(reasons))
+        )
+    else:
+        plan.links[a.key] = new_link
+
+
+def _same_instant(a, b) -> bool:
+    """True if two Todoist/Canvas due strings are the same moment."""
+    pa, pb = parse_due_datetime(a), parse_due_datetime(b)
+    if pa is None or pb is None:
+        return a == b
+    return pa == pb
 
 
 def _link_existing(a, plan, unlinked_by_name) -> Optional[Link]:

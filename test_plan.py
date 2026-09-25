@@ -150,3 +150,56 @@ def test_due_date_removed_in_canvas_leaves_task_alone():
     assert plan.actions == []
     assert plan.links[KEY].canvas_due is None
     assert plan.links[KEY].todoist_id == "t1"
+
+
+# --- updates to open tasks ---
+
+def test_open_task_follows_canvas_deadline_change():
+    plan = _plan([_a(LATER)], links={KEY: _link()}, active={"t1": _task()})
+    [action] = plan.actions
+    assert action.kind == "update"
+    assert action.todoist_id == "t1"
+    assert action.payload == {"due_datetime": LATER_Z, "priority": 3}
+    assert action.link.canvas_due == LATER.isoformat()
+    assert action.link.synced_due == LATER_Z
+    assert action.link.synced_priority == 3
+    assert plan.links[KEY] == _link()  # new link stored only if the update succeeds
+
+
+def test_unchecked_task_gets_current_canvas_deadline():
+    links = {KEY: _link(status=COMPLETED, canvas_due=LATER)}  # change recorded while completed
+    plan = _plan([_a(LATER)], links=links, active={"t1": _task()})
+    [action] = plan.actions
+    assert action.payload == {"due_datetime": LATER_Z, "priority": 3}
+    assert action.link.status == OPEN
+
+
+def test_manual_due_edit_kept_when_canvas_unchanged():
+    plan = _plan([_a()], links={KEY: _link()}, active={"t1": _task(due="2026-09-27T17:00:00Z")})
+    assert plan.actions == []
+
+
+def test_canvas_change_overrides_manual_due_edit_with_note():
+    plan = _plan([_a(LATER)], links={KEY: _link()}, active={"t1": _task(due="2026-09-27T17:00:00Z")})
+    [action] = plan.actions
+    assert action.payload["due_datetime"] == LATER_Z
+    assert any("replaced your Todoist due date" in note for note in plan.notes)
+
+
+def test_sync_owned_priority_escalates_as_deadline_nears():
+    plan = _plan([_a()], links={KEY: _link(synced_priority=3)}, active={"t1": _task(priority=3)})
+    [action] = plan.actions
+    assert action.payload == {"priority": 4}
+
+
+def test_manual_priority_never_lowered():
+    links = {KEY: _link(canvas_due=FAR, synced_due=FAR_Z, synced_priority=1)}
+    plan = _plan([_a(FAR)], links=links, active={"t1": _task(due=FAR_Z, priority=4)})
+    assert plan.actions == []
+
+
+def test_manual_priority_raised_when_deadline_is_close():
+    plan = _plan([_a()], links={KEY: _link(synced_priority=1)}, active={"t1": _task(priority=2)})
+    [action] = plan.actions
+    assert action.payload == {"priority": 4}
+    assert action.link.synced_priority == 4
