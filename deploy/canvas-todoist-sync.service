@@ -1,0 +1,13 @@
+[Unit]
+Description=Canvas to Todoist sync (one run)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=canvas-sync
+WorkingDirectory=/opt/canvas-todoist-sync
+ExecStart=/opt/canvas-todoist-sync/.venv/bin/python -m canvas_todoist_sync
+# A run must finish long before the next tick; the 30 s request timeout and
+# 4 retries keep a normal run to a few minutes even on a bad network.
+TimeoutStartSec=20min
