@@ -4,9 +4,16 @@
 
 **Goal:** Stop tasks you completed in Todoist from coming back on the next sync. To do that, link each Canvas assignment to its Todoist task by ID and ask Todoist directly what happened to a task, instead of guessing from which names are missing.
 
-**Architecture:** Every run goes through four stages: **fetch → plan → apply → save**. All network reads happen first, and any failure aborts the run before anything is written. `plan.py` is pure: it turns the fetched snapshots into a list of Todoist writes plus updated links. `apply.py` is the only code that writes to Todoist. The state file changes from "lists of task names" to "Canvas assignment key → Link {todoist_id, status, …}", and it is saved atomically.
+**Architecture:** Every run goes through four stages: **fetch → plan → apply → save**. All network reads happen first. A Todoist failure, or a failure loading the Canvas course list, aborts the run before anything is written. If one course's assignment list fails, that course is skipped for this run and the others still sync; links for assignments not seen this run are kept unchanged. `plan.py` is pure: it turns the fetched snapshots into a list of Todoist writes plus updated links. `apply.py` is the only code that writes to Todoist. The state file changes from "lists of task names" to "Canvas assignment key → Link {todoist_id, status, …}", and it is saved atomically.
 
-**Tech Stack:** Python 3.13, `requests` (+ `urllib3.Retry`), `python-dotenv`, `pytest`. Todoist unified API v1, Canvas REST API v1.
+**Tech Stack:** Python 3.13, `requests` (+ `urllib3.Retry`), `python-dotenv`, `pytest`. Todoist unified API v1, Canvas REST API v1. Deployed with a systemd timer.
+
+**Runtime:**
+
+- The sync runs **only** on an always-on Proxmox guest. The Mac LaunchAgent (`com.huytran.canvastodoistsync`) and `run_sync.sh` are retired; there is exactly one writer of Todoist and of `sync_state.json`.
+- A **systemd timer** starts `python -m canvas_todoist_sync` **every 30 minutes**. The timer drives one service unit, so a tick that lands while a run is still active does not start a second process.
+- Every run does a **full fetch**: all active Canvas courses, all their assignments, and the Todoist project. There is no cache and no skip-if-unchanged path; do not add one while implementing this plan.
+- Every HTTP request has a **30-second timeout** and is retried **4 times** with backoff inside the run. If the retries are used up on a call that must succeed (see Architecture), the run writes nothing and the next 30-minute tick tries again.
 
 ---
 
@@ -30,7 +37,8 @@ The same thing happens whenever the completed-tasks fetch fails (502/503, connec
 | New assignment due within 30 days, no link | Create a task in the course's section, then store a link with the new task ID |
 | An unlinked open task with exactly the same name already exists | Link to it (no duplicate). Covers the upgrade from v1 and a lost state file |
 | Linked task is missing from the active list | `GET /tasks/{id}`: completed → mark `completed`, deleted/404 → mark `deleted`. **Never recreate** |
-| Status lookup fails (network or 5xx) | Abort the whole run and write nothing. The next scheduled run retries |
+| Status lookup fails (network or 5xx) after the in-run retries | Abort the whole run and write nothing. The next 30-minute tick retries |
+| One course's assignment list fails after the in-run retries | Skip that course this run; its links stay as they are. Other courses still sync |
 | Completed/deleted task, Canvas due date changes | Stays completed/deleted. Save the new `canvas_due` and log it |
 | You uncheck a completed task in Todoist | It shows up in the active list again, so the link becomes `open` and the **current** Canvas due date is applied |
 | Open task, Canvas due date changes | Update the same task ID with the new due date and recalculated priority |
@@ -46,7 +54,7 @@ The same thing happens whenever the completed-tasks fetch fails (502/503, connec
 
 | File | Status | Responsibility |
 |---|---|---|
-| `canvas_todoist_sync/http_session.py` | **Create** | `requests.Session` with retry/backoff for connection errors and 429/5xx |
+| `canvas_todoist_sync/http_session.py` | **Create** | `requests.Session` with a 30 s per-request timeout and retry/backoff for connection errors and 429/5xx |
 | `canvas_todoist_sync/models.py` | Modify | Add `Link`, status constants, `Assignment.key`, `TodoistTask.content` |
 | `canvas_todoist_sync/config.py` | Modify | Add `LEGACY_STATE_DAYS`; remove old completed-tracking constants (Task 11) |
 | `canvas_todoist_sync/canvas_client.py` | Modify | Use the shared session |
@@ -60,7 +68,9 @@ The same thing happens whenever the completed-tasks fetch fails (502/503, connec
 | `fakes.py` | **Create** | In-memory `FakeTodoist`, `FakeCanvas`, `FakeResponse` for tests |
 | `test_http.py`, `test_models.py`, `test_todoist_client.py`, `test_store.py`, `test_plan.py`, `test_apply.py`, `test_run.py` | **Create** | Tests for each unit |
 | `test_sync.py` → `test_sync_logic.py` | Replace (Task 10) | Only the pure date/priority tests remain |
-| `README.md`, `.gitignore` | Modify (Task 12) | Document the new behavior and ignore backups and temp files |
+| `deploy/canvas-todoist-sync.service`, `deploy/canvas-todoist-sync.timer` | **Create** (Task 12) | systemd units: one run every 30 minutes, never two at once |
+| `run_sync.sh` | **Delete** (Task 12) | Mac wrapper, replaced by the systemd units |
+| `README.md`, `.gitignore` | Modify (Task 12) | Document the new behavior and deployment; ignore backups and temp files |
 
 Tests stay at the repo root to match the existing `test_sync.py`. Run `pytest` from the repo root. Until Task 10, the old `sync.py` keeps working unchanged, because new code goes into new modules.
 
@@ -76,7 +86,7 @@ Tests stay at the repo root to match the existing `test_sync.py`. Run `pytest` f
 - [ ] **Step 1: Write the failing test** — create `test_http.py`:
 
 ```python
-from canvas_todoist_sync.http_session import RETRY_STATUSES, build_session
+from canvas_todoist_sync.http_session import DEFAULT_TIMEOUT, RETRY_STATUSES, build_session
 
 
 def test_session_retries_transient_failures():
@@ -86,6 +96,24 @@ def test_session_retries_transient_failures():
     assert set(RETRY_STATUSES) == {429, 500, 502, 503, 504}
     assert set(retry.status_forcelist) == set(RETRY_STATUSES)
     assert {"GET", "POST"} <= set(retry.allowed_methods)
+
+
+def test_session_applies_default_timeout(monkeypatch):
+    import requests
+
+    seen = {}
+
+    def fake_request(self, method, url, **kwargs):
+        seen.update(kwargs)
+        return None
+
+    monkeypatch.setattr(requests.Session, "request", fake_request)
+    session = build_session()
+    session.get("https://api.todoist.com/api/v1/projects")
+    assert seen["timeout"] == DEFAULT_TIMEOUT == 30
+
+    session.get("https://api.todoist.com/api/v1/projects", timeout=5)
+    assert seen["timeout"] == 5
 ```
 
 - [ ] **Step 2: Run it and confirm it fails**
@@ -96,17 +124,40 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'canvas_todoist_sync.h
 - [ ] **Step 3: Implement** — create `canvas_todoist_sync/http_session.py`:
 
 ```python
-"""Shared HTTP session that retries transient network and server failures."""
+"""Shared HTTP session with a per-request timeout and retries for transient failures."""
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 RETRY_STATUSES = (429, 500, 502, 503, 504)
+DEFAULT_TIMEOUT = 30  # seconds; a stalled connection must fail well before the next 30-minute tick
 
 
-def build_session(total_retries: int = 4, backoff_factor: float = 2.0) -> requests.Session:
-    """Session that retries connection errors (e.g. DNS right after wake) and 429/5xx.
+class TimeoutSession(requests.Session):
+    """requests.Session that applies a default timeout to every request.
+
+    `requests` has no session-wide timeout, and without one a stalled
+    connection hangs forever: the retries never start, and later timer ticks
+    are skipped while the stuck process is alive.
+    """
+
+    def __init__(self, timeout: float = DEFAULT_TIMEOUT):
+        super().__init__()
+        self.timeout = timeout
+
+    def request(self, method, url, **kwargs):
+        kwargs.setdefault("timeout", self.timeout)
+        return super().request(method, url, **kwargs)
+
+
+def build_session(
+    total_retries: int = 4, backoff_factor: float = 2.0, timeout: float = DEFAULT_TIMEOUT
+) -> requests.Session:
+    """Session that retries brief network failures and 429/5xx on an always-on host.
+
+    Retries handle a blip that lasts seconds. A longer outage exhausts them,
+    the run aborts without writing, and the next 30-minute tick tries again.
 
     POST is retried too: Todoist de-duplicates writes by X-Request-Id, and a
     retry resends the same headers, so the same id.
@@ -120,7 +171,7 @@ def build_session(total_retries: int = 4, backoff_factor: float = 2.0) -> reques
         respect_retry_after_header=True,
     )
     adapter = HTTPAdapter(max_retries=retry)
-    session = requests.Session()
+    session = TimeoutSession(timeout=timeout)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
@@ -222,13 +273,13 @@ with:
 - [ ] **Step 8: Run the full suite**
 
 Run: `pytest -q`
-Expected: `45 passed`
+Expected: `46 passed`
 
 - [ ] **Step 9: Commit**
 
 ```bash
 git add canvas_todoist_sync/http_session.py canvas_todoist_sync/canvas_client.py canvas_todoist_sync/todoist_client.py test_http.py test_sync.py
-git commit -m "feat: retry transient network and 5xx failures with a shared session"
+git commit -m "feat: shared HTTP session with a request timeout and retries for transient failures"
 ```
 
 ---
@@ -1754,8 +1805,10 @@ Expected: FAIL with `ImportError: cannot import name 'run' from 'canvas_todoist_
 ```python
 """Orchestration: fetch everything, plan, apply, save.
 
-Any fetch failure aborts the run before anything is written, so a flaky
-network can never turn into duplicate or resurrected tasks.
+A Todoist failure or a failure loading the course list aborts the run before
+anything is written, so a flaky network can never turn into duplicate or
+resurrected tasks. A single course whose assignments fail to load is skipped
+for this run and picked up again on the next 30-minute tick.
 """
 
 import argparse
@@ -1791,7 +1844,10 @@ def fetch_assignments(canvas, now, cutoff, linked_keys):
         try:
             raw = canvas.get_assignments(course["id"])
         except requests.RequestException as exc:
-            log.warning(f"  Could not fetch assignments for {course['name']} (left as is): {exc}")
+            log.warning(
+                f"  Could not fetch assignments for {course['name']}"
+                f" (left as is, retried next run): {exc}"
+            )
             continue
         assignments.extend(
             select_assignments(raw, course["id"], course["name"], now, cutoff, linked_keys)
@@ -1803,7 +1859,9 @@ def run(settings: Settings, canvas, todoist, dry_run=False, now=None):
     now = now or datetime.now(timezone.utc)
     cutoff = now + timedelta(days=settings.days_ahead)
 
-    # 1. Fetch. Any exception here aborts the run before anything is written.
+    # 1. Fetch. Any exception here (Todoist, or the Canvas course list) aborts
+    #    the run before anything is written. A single failing course is skipped
+    #    inside fetch_assignments instead.
     project_id = todoist.get_project_id(settings.project_name)
     if not project_id:
         log.warning(f"  WARNING: Project '{settings.project_name}' not found - sections will be skipped.")
@@ -1863,7 +1921,7 @@ def main(argv=None, settings: Settings | None = None):
     try:
         run(settings, CanvasClient(settings), TodoistClient(settings), dry_run=args.dry_run)
     except requests.RequestException as exc:
-        log.error(f"  Aborted before making changes (will retry next run): {exc}")
+        log.error(f"  Aborted before making changes (next 30-minute run retries): {exc}")
         sys.exit(1)
 ```
 
@@ -1976,7 +2034,7 @@ git commit -m "feat: fetch-plan-apply-save sync that never recreates finished ta
 
 Fixes completed tasks reappearing when the project emptied or the
 completed-tasks fetch failed: completion is now looked up by task ID and
-any fetch failure aborts the run before writing."
+a Todoist or course-list fetch failure aborts the run before writing."
 ```
 
 ---
@@ -2087,10 +2145,14 @@ git commit -m "refactor: remove name-based v1 state and completion inference"
 
 ---
 
-### Task 12: Docs, ignore rules, and the first real run
+### Task 12: Docs, systemd deployment, and the first real run
 
 **Files:**
+- Create: `deploy/canvas-todoist-sync.service`, `deploy/canvas-todoist-sync.timer`
+- Delete: `run_sync.sh`
 - Modify: `README.md`, `.gitignore`
+
+This task runs on the Proxmox guest. It assumes the repo is cloned at `/opt/canvas-todoist-sync`, a virtualenv exists at `/opt/canvas-todoist-sync/.venv` with `requirements.txt` installed, `.env` is in the repo root, and a `canvas-sync` user owns the directory. Adjust the paths in the units if yours differ.
 
 - [ ] **Step 1: Ignore backups and temp files.** In `.gitignore`, under `# Local sync state and logs (machine-specific)`, add:
 
@@ -2099,7 +2161,49 @@ sync_state*.json
 .sync_state.json.*.tmp
 ```
 
-- [ ] **Step 2: Update the README.** In `README.md`, replace the intro paragraph (the one starting "Pulls Canvas assignments…") with:
+- [ ] **Step 2: Add the systemd units.** Create `deploy/canvas-todoist-sync.service`:
+
+```ini
+[Unit]
+Description=Canvas to Todoist sync (one run)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=canvas-sync
+WorkingDirectory=/opt/canvas-todoist-sync
+ExecStart=/opt/canvas-todoist-sync/.venv/bin/python -m canvas_todoist_sync
+# A run must finish long before the next tick; the 30 s request timeout and
+# 4 retries keep a normal run to a few minutes even on a bad network.
+TimeoutStartSec=20min
+```
+
+Create `deploy/canvas-todoist-sync.timer`:
+
+```ini
+[Unit]
+Description=Run the Canvas to Todoist sync every 30 minutes
+
+[Timer]
+OnCalendar=*:0/30
+Persistent=true
+RandomizedDelaySec=60
+Unit=canvas-todoist-sync.service
+
+[Install]
+WantedBy=timers.target
+```
+
+A systemd timer only ever starts its service if that service is not already active, so a slow run is never overlapped by the next tick; that tick is skipped and the following one runs. `Persistent=true` runs a missed tick right after a reboot. Output goes to the journal (`journalctl -u canvas-todoist-sync.service`), so `sync_log.txt` is no longer written.
+
+- [ ] **Step 3: Remove the Mac wrapper**
+
+```bash
+git rm run_sync.sh
+```
+
+- [ ] **Step 4: Update the README.** In `README.md`, replace the intro paragraph (the one starting "Pulls Canvas assignments…") with:
 
 ```markdown
 Pulls Canvas assignments due in the next 30 days and creates Todoist tasks,
@@ -2113,18 +2217,43 @@ organized into sections named after each course.
   you set yourself are left alone unless Canvas changes the deadline again.
 - Priority rises as the deadline approaches. If you change it yourself, the sync
   will only ever raise it.
-- If Canvas or Todoist can't be reached, the run stops without changing
-  anything and the next scheduled run tries again.
+- If Todoist can't be reached, the run stops without changing anything and
+  the next run, 30 minutes later, tries again. If a single Canvas course fails
+  to load, that course is skipped for the run and the others still sync.
 ```
 
-In the `## Run` section, after the first code block, add:
+Replace the whole `## Run` section (from `## Run` up to `## Tests`) with:
 
 ````markdown
+## Run
+
+```bash
+python -m canvas_todoist_sync
+```
+
 Preview what a run would do without touching Todoist or the state file:
 
 ```bash
 python -m canvas_todoist_sync --dry-run
 ```
+
+## Deploy (systemd, every 30 minutes)
+
+The sync is meant to run on one always-on host; it is the only writer of
+Todoist and of `sync_state.json`. Units are in `deploy/` and assume the repo
+lives at `/opt/canvas-todoist-sync` with a virtualenv in `.venv`.
+
+```bash
+sudo cp deploy/canvas-todoist-sync.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now canvas-todoist-sync.timer
+systemctl list-timers canvas-todoist-sync.timer   # next run
+journalctl -u canvas-todoist-sync.service -n 50   # last output
+```
+
+The timer starts one run every 30 minutes and never starts a second run while
+one is still going. Each request has a 30-second timeout and is retried 4 times.
+
 ````
 
 Replace the `## Layout` list with:
@@ -2132,7 +2261,7 @@ Replace the `## Layout` list with:
 ```markdown
 - `canvas_todoist_sync/config.py` — `Settings` loaded from env, shared constants
 - `canvas_todoist_sync/models.py` — `Assignment`, `TodoistTask`, `Link` dataclasses
-- `canvas_todoist_sync/http_session.py` — shared session with retry/backoff
+- `canvas_todoist_sync/http_session.py` — shared session with request timeout and retry/backoff
 - `canvas_todoist_sync/canvas_client.py` — Canvas API (HTTP only)
 - `canvas_todoist_sync/todoist_client.py` — Todoist API (HTTP + pagination, task status by ID)
 - `canvas_todoist_sync/store.py` — `sync_state.json` v2: links by Canvas assignment, atomic save, v1 upgrade
@@ -2141,20 +2270,31 @@ Replace the `## Layout` list with:
 - `canvas_todoist_sync/sync_logic.py` — pure date and priority helpers
 - `canvas_todoist_sync/sync.py` — orchestration: fetch → plan → apply → save (`main`, `--dry-run`)
 - `sync.py` — backward-compatible entry-point shim
+- `deploy/` — systemd service and timer (one run every 30 minutes)
 ```
 
-- [ ] **Step 3: Commit the docs**
+- [ ] **Step 5: Commit the docs and deployment files**
 
 ```bash
-git add README.md .gitignore
-git commit -m "docs: describe ID-based sync, dry run, and new layout"
+git add README.md .gitignore deploy/
+git commit -m "docs: describe ID-based sync, dry run, and systemd deployment; drop run_sync.sh"
 ```
 
-- [ ] **Step 4: Back up the v1 state** (the first real run converts it in place)
+- [ ] **Step 6: Retire the Mac agent before anything runs on the server.** Two writers would each apply their own plan to Todoist and the state file. On the Mac:
+
+```bash
+launchctl bootout "gui/$(id -u)/com.huytran.canvastodoistsync"
+mv ~/Library/LaunchAgents/com.huytran.canvastodoistsync.plist ~/Library/LaunchAgents/com.huytran.canvastodoistsync.plist.retired
+launchctl print "gui/$(id -u)/com.huytran.canvastodoistsync"   # expected: "Could not find service"
+```
+
+Then copy the Mac's current `sync_state.json` to `/opt/canvas-todoist-sync/sync_state.json` on the guest, so the v1 upgrade carries over the tasks it already knows about.
+
+- [ ] **Step 7: Back up the v1 state on the guest** (the first real run converts it in place)
 
 Run: `cp sync_state.json sync_state.v1.backup.json`
 
-- [ ] **Step 5: Dry run against the real accounts**
+- [ ] **Step 8: Dry run against the real accounts** (on the guest, from `/opt/canvas-todoist-sync`, with `.venv` activated)
 
 Run: `python -m canvas_todoist_sync --dry-run`
 Expected:
@@ -2165,17 +2305,28 @@ Expected:
 
 If any "would create" line is for something you already finished, stop and investigate before the real run.
 
-- [ ] **Step 6: First real run**
+- [ ] **Step 9: First real run**
 
-Run: `./run_sync.sh && tail -40 sync_log.txt`
+Run: `python -m canvas_todoist_sync`
 Expected: a `Done: X created, Y updated, 0 failed` summary, and `sync_state.json` now starts with `"version": 2`.
 
-- [ ] **Step 7: Live check of the original bug**
+- [ ] **Step 10: Live check of the original bug**
   1. In Todoist, complete one Canvas task (ideally the last open one in the project, which is the exact case that used to break).
-  2. Run `./run_sync.sh` twice.
-  3. Expected in `sync_log.txt`: `Marked completed in Todoist, will not recreate: …` on the first run, and the task is **not** recreated on either run.
+  2. Run `python -m canvas_todoist_sync` twice.
+  3. Expected in the output: `Marked completed in Todoist, will not recreate: …` on the first run, and the task is **not** recreated on either run.
   4. Uncheck it in Todoist and run again. Expected: `Reopened in Todoist: …`, and the task keeps its original ID.
 
-- [ ] **Step 8: Delete the backup once you're satisfied** (keep it for a week or two if unsure)
+- [ ] **Step 11: Turn on the timer**
+
+```bash
+sudo cp deploy/canvas-todoist-sync.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now canvas-todoist-sync.timer
+systemctl list-timers canvas-todoist-sync.timer
+```
+
+Expected: the timer is listed with a `NEXT` time on the next half hour. After that tick passes, `journalctl -u canvas-todoist-sync.service -n 40` shows a `Done:` summary. Then check the overlap guard once: `sudo systemctl start canvas-todoist-sync.service` while a run is active should log that the unit is already running, not start a second process.
+
+- [ ] **Step 12: Delete the backup once you're satisfied** (keep it for a week or two if unsure)
 
 Run: `rm sync_state.v1.backup.json`

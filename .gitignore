@@ -22,3 +22,7 @@ venv/
 .claude/
 .vscode/
 .idea/
+
+# Saved architecture review (local only)
+docs/architecture_design/
+docs/superpowers/plan
